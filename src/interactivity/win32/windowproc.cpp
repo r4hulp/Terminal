@@ -25,13 +25,14 @@
 
 #include "..\inc\ServiceLocator.hpp"
 
-#include "../interactivity/win32/windowtheme.hpp"
-#include "../interactivity/win32/windowUiaProvider.hpp"
-#include "../interactivity/win32/CustomWindowMessages.h"
+#include "..\..\inc\conint.h"
+
+#include "..\interactivity\win32\CustomWindowMessages.h"
+
+#include "..\interactivity\win32\windowUiaProvider.hpp"
 
 #include <iomanip>
 #include <sstream>
-
 
 using namespace Microsoft::Console::Interactivity::Win32;
 using namespace Microsoft::Console::Types;
@@ -39,7 +40,7 @@ using namespace Microsoft::Console::Types;
 // The static and specific window procedures for this class are contained here
 #pragma region Window Procedure
 
-LRESULT CALLBACK Window::s_ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _In_ WPARAM wParam, _In_ LPARAM lParam)
+[[nodiscard]] LRESULT CALLBACK Window::s_ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _In_ WPARAM wParam, _In_ LPARAM lParam)
 {
     // Save the pointer here to the specific window instance when one is created
     if (Message == WM_CREATE)
@@ -61,7 +62,7 @@ LRESULT CALLBACK Window::s_ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, 
     return DefWindowProcW(hWnd, Message, wParam, lParam);
 }
 
-LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _In_ WPARAM wParam, _In_ LPARAM lParam)
+[[nodiscard]] LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _In_ WPARAM wParam, _In_ LPARAM lParam)
 {
     Globals& g = ServiceLocator::LocateGlobals();
     CONSOLE_INFORMATION& gci = g.getConsoleInformation();
@@ -185,14 +186,14 @@ LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _I
         // Now we need to get what the font size *would be* if we had this new DPI. We need to ask the renderer about that.
         const FontInfo& fiCurrent = ScreenInfo.GetCurrentFont();
         FontInfoDesired fiDesired(fiCurrent);
-        FontInfo fiProposed(nullptr, 0, 0, { 0, 0 }, 0);
+        FontInfo fiProposed(L"", 0, 0, { 0, 0 }, 0);
 
         const HRESULT hr = g.pRender->GetProposedFont(dpiProposed, fiDesired, fiProposed);
         // fiProposal will be updated by the renderer for this new font.
         // GetProposedFont can fail if there's no render engine yet.
         // This can happen if we're headless.
         // Just assume that the font is 1x1 in that case.
-        const COORD coordFontProposed = SUCCEEDED(hr) ? fiProposed.GetSize() : COORD({1, 1});
+        const COORD coordFontProposed = SUCCEEDED(hr) ? fiProposed.GetSize() : COORD({ 1, 1 });
 
         // Then from that font size, we need to calculate the client area.
         // Then from the client area we need to calculate the window area (using the proposed DPI scalar here as well.)
@@ -336,16 +337,10 @@ LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _I
 
     case WM_SETTINGCHANGE:
     {
-        try
-        {
-            WindowTheme theme;
-            LOG_IF_FAILED(theme.TrySetDarkMode(hWnd));
-        }
-        CATCH_LOG();
-
+        LOG_IF_FAILED(Microsoft::Console::Internal::Theming::TrySetDarkMode(hWnd));
         gci.GetCursorBlinker().SettingsChanged();
     }
-    __fallthrough;
+        __fallthrough;
 
     case WM_DISPLAYCHANGE:
     {
@@ -490,7 +485,10 @@ LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _I
 
             TrackPopupMenuEx(hHeirMenu,
                              TPM_RIGHTBUTTON | (GetSystemMetrics(SM_MENUDROPALIGNMENT) == 0 ? TPM_LEFTALIGN : TPM_RIGHTALIGN),
-                             GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), hWnd, nullptr);
+                             GET_X_LPARAM(lParam),
+                             GET_Y_LPARAM(lParam),
+                             hWnd,
+                             nullptr);
         }
         else
         {
@@ -647,13 +645,13 @@ LRESULT CALLBACK Window::ConsoleWindowProc(_In_ HWND hWnd, _In_ UINT Message, _I
 
         Status = 1;
 
-        bool isMouseWheel  = Message == WM_MOUSEWHEEL;
+        bool isMouseWheel = Message == WM_MOUSEWHEEL;
         bool isMouseHWheel = Message == WM_MOUSEHWHEEL;
 
         if (isMouseWheel || isMouseHWheel)
         {
             short wheelDelta = (short)HIWORD(wParam);
-            bool hasShift    = (wParam & MK_SHIFT) ? true : false;
+            bool hasShift = (wParam & MK_SHIFT) ? true : false;
 
             Scrolling::s_HandleMouseWheel(isMouseWheel,
                                           isMouseHWheel,
@@ -819,8 +817,7 @@ void Window::_HandleWindowPosChanged(const LPARAM lParam)
 // - <none>
 // Return Value:
 // - S_OK if we succeeded. ERROR_INVALID_HANDLE if there is no HWND. E_FAIL if GDI failed for some reason.
-[[nodiscard]]
-HRESULT Window::_HandlePaint() const
+[[nodiscard]] HRESULT Window::_HandlePaint() const
 {
     HWND const hwnd = GetWindowHandle();
     RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE), hwnd);
@@ -886,7 +883,7 @@ void Window::_HandleDrop(const WPARAM wParam) const
     }
 }
 
-LRESULT Window::_HandleGetObject(const HWND hwnd, const WPARAM wParam, const LPARAM lParam)
+[[nodiscard]] LRESULT Window::_HandleGetObject(const HWND hwnd, const WPARAM wParam, const LPARAM lParam)
 {
     LRESULT retVal = 0;
 

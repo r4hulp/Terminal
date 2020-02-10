@@ -33,8 +33,8 @@ This spec will outline how various terminal frontends will be able to interact w
 5. Visual Studio should be able to persist and edit settings globally, without
    the need for a globals/profiles structure.
 6. The Terminal should be able to read information from a settings structure
-   that's independant of how it's persisted / implemented by the Application
-7. The Component should be able to have it's own settings independent of the
+   that's independent of how it's persisted / implemented by the Application
+7. The Component should be able to have its own settings independent of the
    application that's embedding it, such as font size and face, scrollbar
    visibility, etc. These should be settings that are specific to the component,
    and the Terminal should logically be unaffected by these settings.
@@ -57,7 +57,7 @@ VS needs to be able to persist settings just as a simple set of global settings.
 
 When the application needs to retrieve these settings, they need to use them as a tripartite structure: frontend-component-terminal settings.
 
-Each frontend will have it's own set of settings.
+Each frontend will have its own set of settings.
 Each component implementation will also ned to have some settings that control it.
 The terminal also will have some settings specific to the terminal.
 
@@ -79,7 +79,7 @@ Shell Commandline       |
 
 ### Simple Settings
 
-An application like VS might not even care about settings profiles. They should be able to persist the settings as just a singular entity, and change those as needed, without the additional overhead. Profiles will be something that's more specifc to Project Cascadia.
+An application like VS might not even care about settings profiles. They should be able to persist the settings as just a singular entity, and change those as needed, without the additional overhead. Profiles will be something that's more specific to Project Cascadia.
 
 ### Interface Descriptions
 
@@ -106,13 +106,13 @@ public interface IApplicationSettings
 }
 ```
 
-The Application can store whatever settings it wants in it's implementation of `IApplicationSettings`. When it instantiates a Terminal Component, it will pass it's `IComponentSettings` to it.
+The Application can store whatever settings it wants in its implementation of `IApplicationSettings`. When it instantiates a Terminal Component, it will pass its `IComponentSettings` to it.
 
 The component will retrieve whatever settings it wants from that object, and then pass the `TerminalSettings` to the Terminal it creates.
 
 
-The frontend will be able to get/set it's settings from the `IApplicationSettings` implementation.
-The frontend will be able to create components using the `IComponentSettings` in it's `IApplicationSettings`.
+The frontend will be able to get/set its settings from the `IApplicationSettings` implementation.
+The frontend will be able to create components using the `IComponentSettings` in its `IApplicationSettings`.
 The Component will then create the Terminal using the `TerminalSettings`.
 
 #### Project Cascadia Settings Details
@@ -228,6 +228,6 @@ I don't like that - if we change the font size, we should just recalculate how m
 ## Questions / TODO
 * How does this interplay with setting properties of the terminal component in XAML?
     * I would think that the component would load the XAML properties first, and if the controlling application calls `UpdateSettings` on the component, then those in-XAML properties would likely get overwritten.
-    * It's not necessary to create the component with a `IComponentSettings`, nor is it necessary to call `UpdateSettings`. If you wanted to create a trivial settings-less terminal component entriely in XAML, go right ahead.
+    * It's not necessary to create the component with a `IComponentSettings`, nor is it necessary to call `UpdateSettings`. If you wanted to create a trivial settings-less terminal component entirely in XAML, go right ahead.
     * Any settings that *are* exposed through XAML properties *should* also be exposed in the component's settings implementation as well.
         * Can that be enforced any way? I doubt it.

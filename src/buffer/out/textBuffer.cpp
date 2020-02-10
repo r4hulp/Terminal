@@ -6,10 +6,12 @@
 #include "textBuffer.hpp"
 #include "CharRow.hpp"
 
+#include "../types/inc/utils.hpp"
 #include "../types/inc/convert.hpp"
 
 #pragma hdrstop
 
+using namespace Microsoft::Console;
 using namespace Microsoft::Console::Types;
 
 // Routine Description:
@@ -47,7 +49,7 @@ TextBuffer::TextBuffer(const COORD screenBufferSize,
 // - OtherBuffer - The text buffer to copy properties from
 // Return Value:
 // - <none>
-void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer)
+void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer) noexcept
 {
     GetCursor().CopyProperties(OtherBuffer.GetCursor());
 }
@@ -58,9 +60,9 @@ void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer)
 // - <none>
 // Return Value:
 // - Total number of rows in the buffer
-UINT TextBuffer::TotalRowCount() const
+UINT TextBuffer::TotalRowCount() const noexcept
 {
-    return static_cast<UINT>(_storage.size());
+    return gsl::narrow<UINT>(_storage.size());
 }
 
 // Routine Description:
@@ -76,7 +78,7 @@ const ROW& TextBuffer::GetRowByOffset(const size_t index) const
 
     // Rows are stored circularly, so the index you ask for is offset by the start position and mod the total of rows.
     const size_t offsetIndex = (_firstRow + index) % totalRows;
-    return _storage[offsetIndex];
+    return _storage.at(offsetIndex);
 }
 
 // Routine Description:
@@ -88,7 +90,11 @@ const ROW& TextBuffer::GetRowByOffset(const size_t index) const
 // - reference to the requested row. Asserts if out of bounds.
 ROW& TextBuffer::GetRowByOffset(const size_t index)
 {
-    return const_cast<ROW&>(static_cast<const TextBuffer*>(this)->GetRowByOffset(index));
+    const size_t totalRows = TotalRowCount();
+
+    // Rows are stored circularly, so the index you ask for is offset by the start position and mod the total of rows.
+    const size_t offsetIndex = (_firstRow + index) % totalRows;
+    return _storage.at(offsetIndex);
 }
 
 // Routine Description:
@@ -312,10 +318,12 @@ OutputCellIterator TextBuffer::Write(const OutputCellIterator givenIt)
 // Arguments:
 // - givenIt - Iterator representing output cell data to write
 // - target - the row/column to start writing the text to
+// - wrap - change the wrap flag if we hit the end of the row while writing and there's still more data
 // Return Value:
 // - The final position of the iterator
 OutputCellIterator TextBuffer::Write(const OutputCellIterator givenIt,
-                                     const COORD target)
+                                     const COORD target,
+                                     const std::optional<bool> wrap)
 {
     // Make mutable copy so we can walk.
     auto it = givenIt;
@@ -330,7 +338,8 @@ OutputCellIterator TextBuffer::Write(const OutputCellIterator givenIt,
     while (it && size.IsInBounds(lineTarget))
     {
         // Attempt to write as much data as possible onto this line.
-        it = WriteLine(it, lineTarget, true);
+        // NOTE: if wrap = true/false, we want to set the line's wrap to true/false (respectively) if we reach the end of the line
+        it = WriteLine(it, lineTarget, wrap);
 
         // Move to the next line down.
         lineTarget.X = 0;
@@ -345,13 +354,13 @@ OutputCellIterator TextBuffer::Write(const OutputCellIterator givenIt,
 // Arguments:
 // - givenIt - The iterator that will dereference into cell data to insert
 // - target - Coordinate targeted within output buffer
-// - setWrap - Whether we should try to set the wrap flag if we write up to the end of the line and have more data
+// - wrap - change the wrap flag if we hit the end of the row while writing and there's still more data in the iterator.
 // - limitRight - Optionally restrict the right boundary for writing (e.g. stop writing earlier than the end of line)
 // Return Value:
 // - The iterator, but advanced to where we stopped writing. Use to find input consumed length or cells written length.
 OutputCellIterator TextBuffer::WriteLine(const OutputCellIterator givenIt,
                                          const COORD target,
-                                         const bool setWrap,
+                                         const std::optional<bool> wrap,
                                          std::optional<size_t> limitRight)
 {
     // If we're not in bounds, exit early.
@@ -362,7 +371,7 @@ OutputCellIterator TextBuffer::WriteLine(const OutputCellIterator givenIt,
 
     //  Get the row and write the cells
     ROW& row = GetRowByOffset(target.Y);
-    const auto newIt = row.WriteCells(givenIt, target.X, setWrap, limitRight);
+    const auto newIt = row.WriteCells(givenIt, target.X, wrap, limitRight);
 
     // Take the cell distance written and notify that it needs to be repainted.
     const auto written = newIt.GetCellDistance(givenIt);
@@ -530,17 +539,24 @@ bool TextBuffer::NewlineCursor()
 //Routine Description:
 // - Increments the circular buffer by one. Circular buffer is represented by FirstRow variable.
 //Arguments:
-// - <none>
+// - inVtMode - set to true in VT mode, so standard erase attributes are used for the new row.
 //Return Value:
 // - true if we successfully incremented the buffer.
-bool TextBuffer::IncrementCircularBuffer()
+bool TextBuffer::IncrementCircularBuffer(const bool inVtMode)
 {
     // FirstRow is at any given point in time the array index in the circular buffer that corresponds
     // to the logical position 0 in the window (cursor coordinates and all other coordinates).
     _renderTarget.TriggerCircling();
 
     // First, clean out the old "first row" as it will become the "last row" of the buffer after the circle is performed.
-    bool fSuccess = _storage.at(_firstRow).Reset(_currentAttributes);
+    auto fillAttributes = _currentAttributes;
+    if (inVtMode)
+    {
+        // The VT standard requires that the new row is initialized with
+        // the current background color, but with no meta attributes set.
+        fillAttributes.SetStandardErase();
+    }
+    const bool fSuccess = _storage.at(_firstRow).Reset(fillAttributes);
     if (fSuccess)
     {
         // Now proceed to increment.
@@ -558,30 +574,45 @@ bool TextBuffer::IncrementCircularBuffer()
 
 //Routine Description:
 // - Retrieves the position of the last non-space character on the final line of the text buffer.
+// - By default, we search the entire buffer to find the last non-space character
 //Arguments:
 // - <none>
 //Return Value:
 // - Coordinate position in screen coordinates (offset coordinates, not array index coordinates).
 COORD TextBuffer::GetLastNonSpaceCharacter() const
 {
-    COORD coordEndOfText;
-    // Always search the whole buffer, by starting at the bottom.
-    coordEndOfText.Y = GetSize().BottomInclusive();
+    return GetLastNonSpaceCharacter(GetSize());
+}
 
-    const ROW* pCurrRow = &GetRowByOffset(coordEndOfText.Y);
+//Routine Description:
+// - Retrieves the position of the last non-space character in the given viewport
+// - This is basically an optimized version of GetLastNonSpaceCharacter(), and can be called when
+// - we know the last character is within the given viewport (so we don't need to check the entire buffer)
+//Arguments:
+// - The viewport
+//Return value:
+// - Coordinate position (relative to the text buffer)
+COORD TextBuffer::GetLastNonSpaceCharacter(const Microsoft::Console::Types::Viewport viewport) const
+{
+    COORD coordEndOfText = { 0 };
+    // Search the given viewport by starting at the bottom.
+    coordEndOfText.Y = viewport.BottomInclusive();
+
+    const auto& currRow = GetRowByOffset(coordEndOfText.Y);
     // The X position of the end of the valid text is the Right draw boundary (which is one beyond the final valid character)
-    coordEndOfText.X = static_cast<short>(pCurrRow->GetCharRow().MeasureRight()) - 1;
+    coordEndOfText.X = gsl::narrow<short>(currRow.GetCharRow().MeasureRight()) - 1;
 
     // If the X coordinate turns out to be -1, the row was empty, we need to search backwards for the real end of text.
-    bool fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > 0); // this row is empty, and we're not at the top
+    const auto viewportTop = viewport.Top();
+    bool fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > viewportTop); // this row is empty, and we're not at the top
     while (fDoBackUp)
     {
         coordEndOfText.Y--;
-        pCurrRow = &GetRowByOffset(coordEndOfText.Y);
+        const auto& backupRow = GetRowByOffset(coordEndOfText.Y);
         // We need to back up to the previous row if this line is empty, AND there are more rows
 
-        coordEndOfText.X = static_cast<short>(pCurrRow->GetCharRow().MeasureRight()) - 1;
-        fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > 0);
+        coordEndOfText.X = gsl::narrow<short>(backupRow.GetCharRow().MeasureRight()) - 1;
+        fDoBackUp = (coordEndOfText.X < 0 && coordEndOfText.Y > viewportTop);
     }
 
     // don't allow negative results
@@ -623,7 +654,7 @@ COORD TextBuffer::_GetPreviousFromCursor() const
     return coordPosition;
 }
 
-const SHORT TextBuffer::GetFirstRowIndex() const
+const SHORT TextBuffer::GetFirstRowIndex() const noexcept
 {
     return _firstRow;
 }
@@ -632,7 +663,7 @@ const Viewport TextBuffer::GetSize() const
     return Viewport::FromDimensions({ 0, 0 }, { gsl::narrow<SHORT>(_storage.at(0).size()), gsl::narrow<SHORT>(_storage.size()) });
 }
 
-void TextBuffer::_SetFirstRowIndex(const SHORT FirstRowIndex)
+void TextBuffer::_SetFirstRowIndex(const SHORT FirstRowIndex) noexcept
 {
     _firstRow = FirstRowIndex;
 }
@@ -738,18 +769,17 @@ void TextBuffer::ScrollRows(const SHORT firstRow, const SHORT size, const SHORT 
     _RefreshRowIDs(std::nullopt);
 }
 
-Cursor& TextBuffer::GetCursor()
+Cursor& TextBuffer::GetCursor() noexcept
 {
     return _cursor;
 }
 
-const Cursor& TextBuffer::GetCursor() const
+const Cursor& TextBuffer::GetCursor() const noexcept
 {
     return _cursor;
 }
 
-[[nodiscard]]
-TextAttribute TextBuffer::GetCurrentAttributes() const noexcept
+[[nodiscard]] TextAttribute TextBuffer::GetCurrentAttributes() const noexcept
 {
     return _currentAttributes;
 }
@@ -779,25 +809,24 @@ void TextBuffer::Reset()
 // - newSize - new size of screen.
 // Return Value:
 // - Success if successful. Invalid parameter if screen buffer size is unexpected. No memory if allocation failed.
-[[nodiscard]]
-NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
+[[nodiscard]] NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
 {
     RETURN_HR_IF(E_INVALIDARG, newSize.X < 0 || newSize.Y < 0);
 
-    const auto currentSize = GetSize().Dimensions();
-    const auto attributes = GetCurrentAttributes();
-
-    SHORT TopRow = 0; // new top row of the screen buffer
-    if (newSize.Y <= GetCursor().GetPosition().Y)
-    {
-        TopRow = GetCursor().GetPosition().Y - newSize.Y + 1;
-    }
-    const SHORT TopRowIndex = (GetFirstRowIndex() + TopRow) % currentSize.Y;
-
-    // rotate rows until the top row is at index 0
     try
     {
-        const ROW& newTopRow = _storage[TopRowIndex];
+        const auto currentSize = GetSize().Dimensions();
+        const auto attributes = GetCurrentAttributes();
+
+        SHORT TopRow = 0; // new top row of the screen buffer
+        if (newSize.Y <= GetCursor().GetPosition().Y)
+        {
+            TopRow = GetCursor().GetPosition().Y - newSize.Y + 1;
+        }
+        const SHORT TopRowIndex = (GetFirstRowIndex() + TopRow) % currentSize.Y;
+
+        // rotate rows until the top row is at index 0
+        const ROW& newTopRow = _storage.at(TopRowIndex);
         while (&newTopRow != &_storage.front())
         {
             _storage.push_back(std::move(_storage.front()));
@@ -822,19 +851,18 @@ NTSTATUS TextBuffer::ResizeTraditional(const COORD newSize) noexcept
         // Also take advantage of the row ID refresh loop to resize the rows in the X dimension
         // and cleanup the UnicodeStorage characters that might fall outside the resized buffer.
         _RefreshRowIDs(newSize.X);
-
     }
     CATCH_RETURN();
 
     return S_OK;
 }
 
-const UnicodeStorage& TextBuffer::GetUnicodeStorage() const
+const UnicodeStorage& TextBuffer::GetUnicodeStorage() const noexcept
 {
     return _unicodeStorage;
 }
 
-UnicodeStorage& TextBuffer::GetUnicodeStorage()
+UnicodeStorage& TextBuffer::GetUnicodeStorage() noexcept
 {
     return _unicodeStorage;
 }
@@ -909,7 +937,7 @@ ROW& TextBuffer::_GetPrevRowNoWrap(const ROW& Row)
     }
 
     THROW_HR_IF(E_FAIL, Row.GetId() == _firstRow);
-    return _storage[prevRowIndex];
+    return _storage.at(prevRowIndex);
 }
 
 // Method Description:
@@ -918,9 +946,372 @@ ROW& TextBuffer::_GetPrevRowNoWrap(const ROW& Row)
 // - <none>
 // Return Value:
 // - This buffer's current render target.
-Microsoft::Console::Render::IRenderTarget& TextBuffer::GetRenderTarget()
+Microsoft::Console::Render::IRenderTarget& TextBuffer::GetRenderTarget() noexcept
 {
     return _renderTarget;
+}
+
+// Method Description:
+// - Get the COORD for the beginning of the word you are on
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// - accessibilityMode - when enabled, we continue expanding left until we are at the beginning of a readable word.
+//                        Otherwise, expand left until a character of a new delimiter class is found
+//                        (or a row boundary is encountered)
+// Return Value:
+// - The COORD for the first character on the "word" (inclusive)
+const COORD TextBuffer::GetWordStart(const COORD target, const std::wstring_view wordDelimiters, bool accessibilityMode) const
+{
+    // Consider a buffer with this text in it:
+    // "  word   other  "
+    // In selection (accessibilityMode = false),
+    //  a "word" is defined as the range between two delimiters
+    //  so the words in the example include ["  ", "word", "   ", "other", "  "]
+    // In accessibility (accessibilityMode = true),
+    //  a "word" includes the delimiters after a range of readable characters
+    //  so the words in the example include ["word   ", "other  "]
+    // NOTE: the start anchor (this one) is inclusive, whereas the end anchor (GetWordEnd) is exclusive
+
+    // can't expand left
+    if (target.X == GetSize().Left())
+    {
+        return target;
+    }
+
+    if (accessibilityMode)
+    {
+        return _GetWordStartForAccessibility(target, wordDelimiters);
+    }
+    else
+    {
+        return _GetWordStartForSelection(target, wordDelimiters);
+    }
+}
+
+// Method Description:
+// - Helper method for GetWordStart(). Get the COORD for the beginning of the word (accessibility definition) you are on
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// Return Value:
+// - The COORD for the first character on the current/previous READABLE "word" (inclusive)
+const COORD TextBuffer::_GetWordStartForAccessibility(const COORD target, const std::wstring_view wordDelimiters) const
+{
+    COORD result = target;
+    const auto bufferSize = GetSize();
+    bool stayAtOrigin = false;
+    auto bufferIterator = GetTextDataAt(result);
+
+    // ignore left boundary. Continue until readable text found
+    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    {
+        if (bufferSize.DecrementInBounds(result))
+        {
+            --bufferIterator;
+        }
+        else
+        {
+            // first char in buffer is a DelimiterChar or ControlChar
+            // we can't move any further back
+            stayAtOrigin = true;
+            break;
+        }
+    }
+
+    // make sure we expand to the left boundary or the beginning of the word
+    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) == DelimiterClass::RegularChar)
+    {
+        if (bufferSize.DecrementInBounds(result))
+        {
+            --bufferIterator;
+        }
+        else
+        {
+            // first char in buffer is a RegularChar
+            // we can't move any further back
+            break;
+        }
+    }
+
+    // move off of delimiter and onto word start
+    if (!stayAtOrigin && _GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    {
+        bufferSize.IncrementInBounds(result);
+    }
+
+    return result;
+}
+
+// Method Description:
+// - Helper method for GetWordStart(). Get the COORD for the beginning of the word (selection definition) you are on
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// Return Value:
+// - The COORD for the first character on the current word or delimiter run (stopped by the left margin)
+const COORD TextBuffer::_GetWordStartForSelection(const COORD target, const std::wstring_view wordDelimiters) const
+{
+    COORD result = target;
+    const auto bufferSize = GetSize();
+    auto bufferIterator = GetTextDataAt(result);
+    const auto initialDelimiter = _GetDelimiterClass(*bufferIterator, wordDelimiters);
+
+    // expand left until we hit the left boundary or a different delimiter class
+    while (result.X > bufferSize.Left() && (_GetDelimiterClass(*bufferIterator, wordDelimiters) == initialDelimiter))
+    {
+        bufferSize.DecrementInBounds(result);
+        --bufferIterator;
+    }
+
+    if (_GetDelimiterClass(*bufferIterator, wordDelimiters) != initialDelimiter)
+    {
+        // move off of delimiter
+        bufferSize.IncrementInBounds(result);
+    }
+
+    return result;
+}
+
+// Method Description:
+// - Get the COORD for the beginning of the NEXT word
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// - accessibilityMode - when enabled, we continue expanding right until we are at the beginning of the next READABLE word
+//                        Otherwise, expand right until a character of a new delimiter class is found
+//                        (or a row boundary is encountered)
+// Return Value:
+// - The COORD for the last character on the "word" (inclusive)
+const COORD TextBuffer::GetWordEnd(const COORD target, const std::wstring_view wordDelimiters, bool accessibilityMode) const
+{
+    // Consider a buffer with this text in it:
+    // "  word   other  "
+    // In selection (accessibilityMode = false),
+    //  a "word" is defined as the range between two delimiters
+    //  so the words in the example include ["  ", "word", "   ", "other", "  "]
+    // In accessibility (accessibilityMode = true),
+    //  a "word" includes the delimiters after a range of readable characters
+    //  so the words in the example include ["word   ", "other  "]
+    // NOTE: the end anchor (this one) is exclusive, whereas the start anchor (GetWordStart) is inclusive
+
+    if (accessibilityMode)
+    {
+        return _GetWordEndForAccessibility(target, wordDelimiters);
+    }
+    else
+    {
+        return _GetWordEndForSelection(target, wordDelimiters);
+    }
+}
+
+// Method Description:
+// - Helper method for GetWordEnd(). Get the COORD for the beginning of the next READABLE word
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// Return Value:
+// - The COORD for the first character of the next readable "word". If no next word, return one past the end of the buffer
+const COORD TextBuffer::_GetWordEndForAccessibility(const COORD target, const std::wstring_view wordDelimiters) const
+{
+    const auto bufferSize = GetSize();
+    COORD result = target;
+    auto bufferIterator = GetTextDataAt(result);
+
+    // ignore right boundary. Continue through readable text found
+    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) == DelimiterClass::RegularChar)
+    {
+        if (bufferSize.IncrementInBounds(result, true))
+        {
+            ++bufferIterator;
+        }
+        else
+        {
+            // last char in buffer is a RegularChar
+            // we can't move any further forward
+            break;
+        }
+    }
+
+    // make sure we expand to the beginning of the NEXT word
+    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    {
+        if (bufferSize.IncrementInBounds(result, true))
+        {
+            ++bufferIterator;
+        }
+        else
+        {
+            // we are at the EndInclusive COORD
+            // this signifies that we must include the last char in the buffer
+            // but the position of the COORD points to nothing
+            break;
+        }
+    }
+
+    return result;
+}
+
+// Method Description:
+// - Helper method for GetWordEnd(). Get the COORD for the beginning of the NEXT word
+// Arguments:
+// - target - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// Return Value:
+// - The COORD for the last character of the current word or delimiter run (stopped by right margin)
+const COORD TextBuffer::_GetWordEndForSelection(const COORD target, const std::wstring_view wordDelimiters) const
+{
+    const auto bufferSize = GetSize();
+    COORD result = target;
+    auto bufferIterator = GetTextDataAt(result);
+
+    // can't expand right
+    if (target.X == bufferSize.RightInclusive())
+    {
+        return result;
+    }
+
+    const auto initialDelimiter = _GetDelimiterClass(*bufferIterator, wordDelimiters);
+
+    // expand right until we hit the right boundary or a different delimiter class
+    while (result.X < bufferSize.RightInclusive() && (_GetDelimiterClass(*bufferIterator, wordDelimiters) == initialDelimiter))
+    {
+        bufferSize.IncrementInBounds(result);
+        ++bufferIterator;
+    }
+
+    if (_GetDelimiterClass(*bufferIterator, wordDelimiters) != initialDelimiter)
+    {
+        // move off of delimiter
+        bufferSize.DecrementInBounds(result);
+    }
+
+    return result;
+}
+
+// Method Description:
+// - Update pos to be the position of the first character of the next word. This is used for accessibility
+// Arguments:
+// - pos - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// - lastCharPos - the position of the last nonspace character in the text buffer (to improve performance)
+// Return Value:
+// - true, if successfully updated pos. False, if we are unable to move (usually due to a buffer boundary)
+// - pos - The COORD for the first character on the "word" (inclusive)
+bool TextBuffer::MoveToNextWord(COORD& pos, const std::wstring_view wordDelimiters, COORD lastCharPos) const
+{
+    auto copy = pos;
+    const auto bufferSize = GetSize();
+
+    auto text = GetTextDataAt(copy)->data();
+    auto delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+
+    // started on a word, continue until the end of the word
+    while (delimiterClass == DelimiterClass::RegularChar)
+    {
+        if (!bufferSize.IncrementInBounds(copy))
+        {
+            // last char in buffer is a RegularChar
+            // thus there is no next word
+            return false;
+        }
+        text = GetTextDataAt(copy)->data();
+        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+    }
+
+    // we are already on/past the last RegularChar
+    if (bufferSize.CompareInBounds(copy, lastCharPos) >= 0)
+    {
+        return false;
+    }
+
+    // on whitespace, continue until the beginning of the next word
+    while (delimiterClass != DelimiterClass::RegularChar)
+    {
+        if (!bufferSize.IncrementInBounds(copy))
+        {
+            // last char in buffer is a DelimiterChar or ControlChar
+            // there is no next word
+            return false;
+        }
+        text = GetTextDataAt(copy)->data();
+        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+    }
+
+    // successful move, copy result out
+    pos = copy;
+    return true;
+}
+
+// Method Description:
+// - Update pos to be the position of the first character of the previous word. This is used for accessibility
+// Arguments:
+// - pos - a COORD on the word you are currently on
+// - wordDelimiters - what characters are we considering for the separation of words
+// Return Value:
+// - true, if successfully updated pos. False, if we are unable to move (usually due to a buffer boundary)
+// - pos - The COORD for the first character on the "word" (inclusive)
+bool TextBuffer::MoveToPreviousWord(COORD& pos, std::wstring_view wordDelimiters) const
+{
+    auto copy = pos;
+    auto bufferSize = GetSize();
+
+    auto text = GetTextDataAt(copy)->data();
+    auto delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+
+    // started on whitespace/delimiter, continue until the end of the previous word
+    while (delimiterClass != DelimiterClass::RegularChar)
+    {
+        if (!bufferSize.DecrementInBounds(copy))
+        {
+            // first char in buffer is a DelimiterChar or ControlChar
+            // there is no previous word
+            return false;
+        }
+        text = GetTextDataAt(copy)->data();
+        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+    }
+
+    // on a word, continue until the beginning of the word
+    while (delimiterClass == DelimiterClass::RegularChar)
+    {
+        if (!bufferSize.DecrementInBounds(copy))
+        {
+            // first char in buffer is a RegularChar
+            // there is no previous word
+            return false;
+        }
+        text = GetTextDataAt(copy)->data();
+        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+    }
+
+    // successful move, copy result out
+    pos = copy;
+    return true;
+}
+
+// Method Description:
+// - get delimiter class for buffer cell data
+// - used for double click selection and uia word navigation
+// Arguments:
+// - cellChar: the char saved to the buffer cell under observation
+// - wordDelimiters: the delimiters defined as a part of the DelimiterClass::DelimiterChar
+// Return Value:
+// - the delimiter class for the given char
+TextBuffer::DelimiterClass TextBuffer::_GetDelimiterClass(const std::wstring_view cellChar, const std::wstring_view wordDelimiters) const noexcept
+{
+    if (cellChar.at(0) <= UNICODE_SPACE)
+    {
+        return DelimiterClass::ControlChar;
+    }
+    else if (wordDelimiters.find(cellChar) != std::wstring_view::npos)
+    {
+        return DelimiterClass::DelimiterChar;
+    }
+    else
+    {
+        return DelimiterClass::RegularChar;
+    }
 }
 
 // Routine Description:
@@ -963,9 +1354,9 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
         std::vector<COLORREF> selectionBkAttr;
 
         // preallocate to avoid reallocs
-        selectionText.reserve(highlight.Width() + 2); // + 2 for \r\n if we munged it
-        selectionFgAttr.reserve(highlight.Width() + 2);
-        selectionBkAttr.reserve(highlight.Width() + 2);
+        selectionText.reserve(gsl::narrow<size_t>(highlight.Width()) + 2); // + 2 for \r\n if we munged it
+        selectionFgAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
+        selectionBkAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
 
         // copy char data into the string buffer, skipping trailing bytes
         while (it)
@@ -984,6 +1375,8 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
                     selectionBkAttr.push_back(CellBkAttr);
                 }
             }
+#pragma warning(suppress : 26444)
+            // TODO GH 2675: figure out why there's custom construction/destruction happening here
             it++;
         }
 
@@ -1012,7 +1405,7 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
                 // always apply \r\n for box selection
                 if (!lineSelection || !GetRowByOffset(iRow).GetCharRow().WasWrapForced())
                 {
-                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00);      // cant see CR/LF so just use black FG & BK
+                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00); // cant see CR/LF so just use black FG & BK
 
                     selectionText.push_back(UNICODE_CARRIAGERETURN);
                     selectionText.push_back(UNICODE_LINEFEED);
@@ -1024,10 +1417,604 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
             }
         }
 
-        data.text.emplace_back(selectionText);
-        data.FgAttr.emplace_back(selectionFgAttr);
-        data.BkAttr.emplace_back(selectionBkAttr);
+        data.text.emplace_back(std::move(selectionText));
+        data.FgAttr.emplace_back(std::move(selectionFgAttr));
+        data.BkAttr.emplace_back(std::move(selectionBkAttr));
     }
 
     return data;
+}
+
+// Routine Description:
+// - Generates a CF_HTML compliant structure based on the passed in text and color data
+// Arguments:
+// - rows - the text and color data we will format & encapsulate
+// - backgroundColor - default background color for characters, also used in padding
+// - fontHeightPoints - the unscaled font height
+// - fontFaceName - the name of the font used
+// - htmlTitle - value used in title tag of html header. Used to name the application
+// Return Value:
+// - string containing the generated HTML
+std::string TextBuffer::GenHTML(const TextAndColor& rows, const int fontHeightPoints, const std::wstring_view fontFaceName, const COLORREF backgroundColor, const std::string& htmlTitle)
+{
+    try
+    {
+        std::ostringstream htmlBuilder;
+
+        // First we have to add some standard
+        // HTML boiler plate required for CF_HTML
+        // as part of the HTML Clipboard format
+        const std::string htmlHeader =
+            "<!DOCTYPE><HTML><HEAD><TITLE>" + htmlTitle + "</TITLE></HEAD><BODY>";
+        htmlBuilder << htmlHeader;
+
+        htmlBuilder << "<!--StartFragment -->";
+
+        // apply global style in div element
+        {
+            htmlBuilder << "<DIV STYLE=\"";
+            htmlBuilder << "display:inline-block;";
+            htmlBuilder << "white-space:pre;";
+
+            htmlBuilder << "background-color:";
+            htmlBuilder << Utils::ColorToHexString(backgroundColor);
+            htmlBuilder << ";";
+
+            htmlBuilder << "font-family:";
+            htmlBuilder << "'";
+            htmlBuilder << ConvertToA(CP_UTF8, fontFaceName);
+            htmlBuilder << "',";
+            // even with different font, add monospace as fallback
+            htmlBuilder << "monospace;";
+
+            htmlBuilder << "font-size:";
+            htmlBuilder << fontHeightPoints;
+            htmlBuilder << "pt;";
+
+            // note: MS Word doesn't support padding (in this way at least)
+            htmlBuilder << "padding:";
+            htmlBuilder << 4; // todo: customizable padding
+            htmlBuilder << "px;";
+
+            htmlBuilder << "\">";
+        }
+
+        // copy text and info color from buffer
+        bool hasWrittenAnyText = false;
+        std::optional<COLORREF> fgColor = std::nullopt;
+        std::optional<COLORREF> bkColor = std::nullopt;
+        for (size_t row = 0; row < rows.text.size(); row++)
+        {
+            size_t startOffset = 0;
+
+            if (row != 0)
+            {
+                htmlBuilder << "<BR>";
+            }
+
+            for (size_t col = 0; col < rows.text.at(row).length(); col++)
+            {
+                const auto writeAccumulatedChars = [&](bool includeCurrent) {
+                    if (col >= startOffset)
+                    {
+                        const auto unescapedText = ConvertToA(CP_UTF8, std::wstring_view(rows.text.at(row)).substr(startOffset, col - startOffset + includeCurrent));
+                        for (const auto c : unescapedText)
+                        {
+                            switch (c)
+                            {
+                            case '<':
+                                htmlBuilder << "&lt;";
+                                break;
+                            case '>':
+                                htmlBuilder << "&gt;";
+                                break;
+                            case '&':
+                                htmlBuilder << "&amp;";
+                                break;
+                            default:
+                                htmlBuilder << c;
+                            }
+                        }
+
+                        startOffset = col;
+                    }
+                };
+
+                if (rows.text.at(row).at(col) == '\r' || rows.text.at(row).at(col) == '\n')
+                {
+                    // do not include \r nor \n as they don't have color attributes
+                    // and are not HTML friendly. For line break use '<BR>' instead.
+                    writeAccumulatedChars(false);
+                    break;
+                }
+
+                bool colorChanged = false;
+                if (!fgColor.has_value() || rows.FgAttr.at(row).at(col) != fgColor.value())
+                {
+                    fgColor = rows.FgAttr.at(row).at(col);
+                    colorChanged = true;
+                }
+
+                if (!bkColor.has_value() || rows.BkAttr.at(row).at(col) != bkColor.value())
+                {
+                    bkColor = rows.BkAttr.at(row).at(col);
+                    colorChanged = true;
+                }
+
+                if (colorChanged)
+                {
+                    writeAccumulatedChars(false);
+
+                    if (hasWrittenAnyText)
+                    {
+                        htmlBuilder << "</SPAN>";
+                    }
+
+                    htmlBuilder << "<SPAN STYLE=\"";
+                    htmlBuilder << "color:";
+                    htmlBuilder << Utils::ColorToHexString(fgColor.value());
+                    htmlBuilder << ";";
+                    htmlBuilder << "background-color:";
+                    htmlBuilder << Utils::ColorToHexString(bkColor.value());
+                    htmlBuilder << ";";
+                    htmlBuilder << "\">";
+                }
+
+                hasWrittenAnyText = true;
+
+                // if this is the last character in the row, flush the whole row
+                if (col == rows.text.at(row).length() - 1)
+                {
+                    writeAccumulatedChars(true);
+                }
+            }
+        }
+
+        if (hasWrittenAnyText)
+        {
+            // last opened span wasn't closed in loop above, so close it now
+            htmlBuilder << "</SPAN>";
+        }
+
+        htmlBuilder << "</DIV>";
+
+        htmlBuilder << "<!--EndFragment -->";
+
+        constexpr std::string_view HtmlFooter = "</BODY></HTML>";
+        htmlBuilder << HtmlFooter;
+
+        // once filled with values, there will be exactly 157 bytes in the clipboard header
+        constexpr size_t ClipboardHeaderSize = 157;
+
+        // these values are byte offsets from start of clipboard
+        const size_t htmlStartPos = ClipboardHeaderSize;
+        const size_t htmlEndPos = ClipboardHeaderSize + gsl::narrow<size_t>(htmlBuilder.tellp());
+        const size_t fragStartPos = ClipboardHeaderSize + gsl::narrow<size_t>(htmlHeader.length());
+        const size_t fragEndPos = htmlEndPos - HtmlFooter.length();
+
+        // header required by HTML 0.9 format
+        std::ostringstream clipHeaderBuilder;
+        clipHeaderBuilder << "Version:0.9\r\n";
+        clipHeaderBuilder << std::setfill('0');
+        clipHeaderBuilder << "StartHTML:" << std::setw(10) << htmlStartPos << "\r\n";
+        clipHeaderBuilder << "EndHTML:" << std::setw(10) << htmlEndPos << "\r\n";
+        clipHeaderBuilder << "StartFragment:" << std::setw(10) << fragStartPos << "\r\n";
+        clipHeaderBuilder << "EndFragment:" << std::setw(10) << fragEndPos << "\r\n";
+        clipHeaderBuilder << "StartSelection:" << std::setw(10) << fragStartPos << "\r\n";
+        clipHeaderBuilder << "EndSelection:" << std::setw(10) << fragEndPos << "\r\n";
+
+        return clipHeaderBuilder.str() + htmlBuilder.str();
+    }
+    catch (...)
+    {
+        LOG_HR(wil::ResultFromCaughtException());
+        return {};
+    }
+}
+
+// Routine Description:
+// - Generates an RTF document based on the passed in text and color data
+//   RTF 1.5 Spec: https://www.biblioscape.com/rtf15_spec.htm
+// Arguments:
+// - rows - the text and color data we will format & encapsulate
+// - backgroundColor - default background color for characters, also used in padding
+// - fontHeightPoints - the unscaled font height
+// - fontFaceName - the name of the font used
+// - htmlTitle - value used in title tag of html header. Used to name the application
+// Return Value:
+// - string containing the generated RTF
+std::string TextBuffer::GenRTF(const TextAndColor& rows, const int fontHeightPoints, const std::wstring_view fontFaceName, const COLORREF backgroundColor)
+{
+    try
+    {
+        std::ostringstream rtfBuilder;
+
+        // start rtf
+        rtfBuilder << "{";
+
+        // Standard RTF header.
+        // This is similar to the header gnerated by WordPad.
+        // \ansi - specifies that the ANSI char set is used in the current doc
+        // \ansicpg1252 - represents the ANSI code page which is used to perform the Unicode to ANSI conversion when writing RTF text
+        // \deff0 - specifes that the default font for the document is the one at index 0 in the font table
+        // \nouicompat - ?
+        rtfBuilder << "\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat";
+
+        // font table
+        rtfBuilder << "{\\fonttbl{\\f0\\fmodern\\fcharset0 " << ConvertToA(CP_UTF8, fontFaceName) << ";}}";
+
+        // map to keep track of colors:
+        // keys are colors represented by COLORREF
+        // values are indices of the corresponding colors in the color table
+        std::unordered_map<COLORREF, int> colorMap;
+        int nextColorIndex = 1; // leave 0 for the default color and start from 1.
+
+        // RTF color table
+        std::ostringstream colorTableBuilder;
+        colorTableBuilder << "{\\colortbl ;";
+        colorTableBuilder << "\\red" << static_cast<int>(GetRValue(backgroundColor))
+                          << "\\green" << static_cast<int>(GetGValue(backgroundColor))
+                          << "\\blue" << static_cast<int>(GetBValue(backgroundColor))
+                          << ";";
+        colorMap[backgroundColor] = nextColorIndex++;
+
+        // content
+        std::ostringstream contentBuilder;
+        contentBuilder << "\\viewkind4\\uc4";
+
+        // paragraph styles
+        // \fs specificies font size in half-points i.e. \fs20 results in a font size
+        // of 10 pts. That's why, font size is multiplied by 2 here.
+        contentBuilder << "\\pard\\slmult1\\f0\\fs" << std::to_string(2 * fontHeightPoints)
+                       << "\\highlight1"
+                       << " ";
+
+        std::optional<COLORREF> fgColor = std::nullopt;
+        std::optional<COLORREF> bkColor = std::nullopt;
+        for (size_t row = 0; row < rows.text.size(); ++row)
+        {
+            size_t startOffset = 0;
+
+            if (row != 0)
+            {
+                contentBuilder << "\\line "; // new line
+            }
+
+            for (size_t col = 0; col < rows.text.at(row).length(); ++col)
+            {
+                const auto writeAccumulatedChars = [&](bool includeCurrent) {
+                    if (col >= startOffset)
+                    {
+                        const auto unescapedText = ConvertToA(CP_UTF8, std::wstring_view(rows.text.at(row)).substr(startOffset, col - startOffset + includeCurrent));
+                        for (const auto c : unescapedText)
+                        {
+                            switch (c)
+                            {
+                            case '\\':
+                            case '{':
+                            case '}':
+                                contentBuilder << "\\" << c;
+                                break;
+                            default:
+                                contentBuilder << c;
+                            }
+                        }
+
+                        startOffset = col;
+                    }
+                };
+
+                if (rows.text.at(row).at(col) == '\r' || rows.text.at(row).at(col) == '\n')
+                {
+                    // do not include \r nor \n as they don't have color attributes.
+                    // For line break use \line instead.
+                    writeAccumulatedChars(false);
+                    break;
+                }
+
+                bool colorChanged = false;
+                if (!fgColor.has_value() || rows.FgAttr.at(row).at(col) != fgColor.value())
+                {
+                    fgColor = rows.FgAttr.at(row).at(col);
+                    colorChanged = true;
+                }
+
+                if (!bkColor.has_value() || rows.BkAttr.at(row).at(col) != bkColor.value())
+                {
+                    bkColor = rows.BkAttr.at(row).at(col);
+                    colorChanged = true;
+                }
+
+                if (colorChanged)
+                {
+                    writeAccumulatedChars(false);
+
+                    int bkColorIndex = 0;
+                    if (colorMap.find(bkColor.value()) != colorMap.end())
+                    {
+                        // color already exists in the map, just retrieve the index
+                        bkColorIndex = colorMap[bkColor.value()];
+                    }
+                    else
+                    {
+                        // color not present in the map, so add it
+                        colorTableBuilder << "\\red" << static_cast<int>(GetRValue(bkColor.value()))
+                                          << "\\green" << static_cast<int>(GetGValue(bkColor.value()))
+                                          << "\\blue" << static_cast<int>(GetBValue(bkColor.value()))
+                                          << ";";
+                        colorMap[bkColor.value()] = nextColorIndex;
+                        bkColorIndex = nextColorIndex++;
+                    }
+
+                    int fgColorIndex = 0;
+                    if (colorMap.find(fgColor.value()) != colorMap.end())
+                    {
+                        // color already exists in the map, just retrieve the index
+                        fgColorIndex = colorMap[fgColor.value()];
+                    }
+                    else
+                    {
+                        // color not present in the map, so add it
+                        colorTableBuilder << "\\red" << static_cast<int>(GetRValue(fgColor.value()))
+                                          << "\\green" << static_cast<int>(GetGValue(fgColor.value()))
+                                          << "\\blue" << static_cast<int>(GetBValue(fgColor.value()))
+                                          << ";";
+                        colorMap[fgColor.value()] = nextColorIndex;
+                        fgColorIndex = nextColorIndex++;
+                    }
+
+                    contentBuilder << "\\highglight" << bkColorIndex
+                                   << "\\cf" << fgColorIndex
+                                   << " ";
+                }
+
+                // if this is the last character in the row, flush the whole row
+                if (col == rows.text.at(row).length() - 1)
+                {
+                    writeAccumulatedChars(true);
+                }
+            }
+        }
+
+        // end colortbl
+        colorTableBuilder << "}";
+
+        // add color table to the final RTF
+        rtfBuilder << colorTableBuilder.str();
+
+        // add the text content to the final RTF
+        rtfBuilder << contentBuilder.str();
+
+        // end rtf
+        rtfBuilder << "}";
+
+        return rtfBuilder.str();
+    }
+    catch (...)
+    {
+        LOG_HR(wil::ResultFromCaughtException());
+        return {};
+    }
+}
+
+// Function Description:
+// - Reflow the contents from the old buffer into the new buffer. The new buffer
+//   can have different dimensions than the old buffer. If it does, then this
+//   function will attempt to maintain the logical contents of the old buffer,
+//   by continuing wrapped lines onto the next line in the new buffer.
+// Arguments:
+// - oldBuffer - the text buffer to copy the contents FROM
+// - newBuffer - the text buffer to copy the contents TO
+// Return Value:
+// - S_OK if we successfully copied the contents to the new buffer, otherwise an appropriate HRESULT.
+HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer)
+{
+    Cursor& oldCursor = oldBuffer.GetCursor();
+    Cursor& newCursor = newBuffer.GetCursor();
+    // skip any drawing updates that might occur as we manipulate the new buffer
+    oldCursor.StartDeferDrawing();
+    newCursor.StartDeferDrawing();
+
+    // We need to save the old cursor position so that we can
+    // place the new cursor back on the equivalent character in
+    // the new buffer.
+    const COORD cOldCursorPos = oldCursor.GetPosition();
+    const COORD cOldLastChar = oldBuffer.GetLastNonSpaceCharacter();
+
+    short const cOldRowsTotal = cOldLastChar.Y + 1;
+    short const cOldColsTotal = oldBuffer.GetSize().Width();
+
+    COORD cNewCursorPos = { 0 };
+    bool fFoundCursorPos = false;
+
+    HRESULT hr = S_OK;
+    // Loop through all the rows of the old buffer and reprint them into the new buffer
+    for (short iOldRow = 0; iOldRow < cOldRowsTotal; iOldRow++)
+    {
+        // Fetch the row and its "right" which is the last printable character.
+        const ROW& row = oldBuffer.GetRowByOffset(iOldRow);
+        const CharRow& charRow = row.GetCharRow();
+        short iRight = gsl::narrow_cast<short>(charRow.MeasureRight());
+
+        // There is a special case here. If the row has a "wrap"
+        // flag on it, but the right isn't equal to the width (one
+        // index past the final valid index in the row) then there
+        // were a bunch trailing of spaces in the row.
+        // (But the measuring functions for each row Left/Right do
+        // not count spaces as "displayable" so they're not
+        // included.)
+        // As such, adjust the "right" to be the width of the row
+        // to capture all these spaces
+        if (charRow.WasWrapForced())
+        {
+            iRight = cOldColsTotal;
+
+            // And a combined special case.
+            // If we wrapped off the end of the row by adding a
+            // piece of padding because of a double byte LEADING
+            // character, then remove one from the "right" to
+            // leave this padding out of the copy process.
+            if (charRow.WasDoubleBytePadded())
+            {
+                iRight--;
+            }
+        }
+
+        // Loop through every character in the current row (up to
+        // the "right" boundary, which is one past the final valid
+        // character)
+        for (short iOldCol = 0; iOldCol < iRight; iOldCol++)
+        {
+            if (iOldCol == cOldCursorPos.X && iOldRow == cOldCursorPos.Y)
+            {
+                cNewCursorPos = newCursor.GetPosition();
+                fFoundCursorPos = true;
+            }
+
+            try
+            {
+                // TODO: MSFT: 19446208 - this should just use an iterator and the inserter...
+                const auto glyph = row.GetCharRow().GlyphAt(iOldCol);
+                const auto dbcsAttr = row.GetCharRow().DbcsAttrAt(iOldCol);
+                const auto textAttr = row.GetAttrRow().GetAttrByColumn(iOldCol);
+
+                if (!newBuffer.InsertCharacter(glyph, dbcsAttr, textAttr))
+                {
+                    hr = E_OUTOFMEMORY;
+                    break;
+                }
+            }
+            CATCH_RETURN();
+        }
+        if (SUCCEEDED(hr))
+        {
+            // If we didn't have a full row to copy, insert a new
+            // line into the new buffer.
+            // Only do so if we were not forced to wrap. If we did
+            // force a word wrap, then the existing line break was
+            // only because we ran out of space.
+            if (iRight < cOldColsTotal && !charRow.WasWrapForced())
+            {
+                if (iRight == cOldCursorPos.X && iOldRow == cOldCursorPos.Y)
+                {
+                    cNewCursorPos = newCursor.GetPosition();
+                    fFoundCursorPos = true;
+                }
+                // Only do this if it's not the final line in the buffer.
+                // On the final line, we want the cursor to sit
+                // where it is done printing for the cursor
+                // adjustment to follow.
+                if (iOldRow < cOldRowsTotal - 1)
+                {
+                    hr = newBuffer.NewlineCursor() ? hr : E_OUTOFMEMORY;
+                }
+                else
+                {
+                    // If we are on the final line of the buffer, we have one more check.
+                    // We got into this code path because we are at the right most column of a row in the old buffer
+                    // that had a hard return (no wrap was forced).
+                    // However, as we're inserting, the old row might have just barely fit into the new buffer and
+                    // caused a new soft return (wrap was forced) putting the cursor at x=0 on the line just below.
+                    // We need to preserve the memory of the hard return at this point by inserting one additional
+                    // hard newline, otherwise we've lost that information.
+                    // We only do this when the cursor has just barely poured over onto the next line so the hard return
+                    // isn't covered by the soft one.
+                    // e.g.
+                    // The old line was:
+                    // |aaaaaaaaaaaaaaaaaaa | with no wrap which means there was a newline after that final a.
+                    // The cursor was here ^
+                    // And the new line will be:
+                    // |aaaaaaaaaaaaaaaaaaa| and show a wrap at the end
+                    // |                   |
+                    //  ^ and the cursor is now there.
+                    // If we leave it like this, we've lost the newline information.
+                    // So we insert one more newline so a continued reflow of this buffer by resizing larger will
+                    // continue to look as the original output intended with the newline data.
+                    // After this fix, it looks like this:
+                    // |aaaaaaaaaaaaaaaaaaa| no wrap at the end (preserved hard newline)
+                    // |                   |
+                    //  ^ and the cursor is now here.
+                    const COORD coordNewCursor = newCursor.GetPosition();
+                    if (coordNewCursor.X == 0 && coordNewCursor.Y > 0)
+                    {
+                        if (newBuffer.GetRowByOffset(gsl::narrow_cast<size_t>(coordNewCursor.Y) - 1).GetCharRow().WasWrapForced())
+                        {
+                            hr = newBuffer.NewlineCursor() ? hr : E_OUTOFMEMORY;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (SUCCEEDED(hr))
+    {
+        // Finish copying remaining parameters from the old text buffer to the new one
+        newBuffer.CopyProperties(oldBuffer);
+
+        // If we found where to put the cursor while placing characters into the buffer,
+        //   just put the cursor there. Otherwise we have to advance manually.
+        if (fFoundCursorPos)
+        {
+            newCursor.SetPosition(cNewCursorPos);
+        }
+        else
+        {
+            // Advance the cursor to the same offset as before
+            // get the number of newlines and spaces between the old end of text and the old cursor,
+            //   then advance that many newlines and chars
+            int iNewlines = cOldCursorPos.Y - cOldLastChar.Y;
+            const int iIncrements = cOldCursorPos.X - cOldLastChar.X;
+            const COORD cNewLastChar = newBuffer.GetLastNonSpaceCharacter();
+
+            // If the last row of the new buffer wrapped, there's going to be one less newline needed,
+            //   because the cursor is already on the next line
+            if (newBuffer.GetRowByOffset(cNewLastChar.Y).GetCharRow().WasWrapForced())
+            {
+                iNewlines = std::max(iNewlines - 1, 0);
+            }
+            else
+            {
+                // if this buffer didn't wrap, but the old one DID, then the d(columns) of the
+                //   old buffer will be one more than in this buffer, so new need one LESS.
+                if (oldBuffer.GetRowByOffset(cOldLastChar.Y).GetCharRow().WasWrapForced())
+                {
+                    iNewlines = std::max(iNewlines - 1, 0);
+                }
+            }
+
+            for (int r = 0; r < iNewlines; r++)
+            {
+                if (!newBuffer.NewlineCursor())
+                {
+                    hr = E_OUTOFMEMORY;
+                    break;
+                }
+            }
+            if (SUCCEEDED(hr))
+            {
+                for (int c = 0; c < iIncrements - 1; c++)
+                {
+                    if (!newBuffer.IncrementCursor())
+                    {
+                        hr = E_OUTOFMEMORY;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        // Save old cursor size before we delete it
+        ULONG const ulSize = oldCursor.GetSize();
+
+        // Set size back to real size as it will be taking over the rendering duties.
+        newCursor.SetSize(ulSize);
+    }
+
+    newCursor.EndDeferDrawing();
+    oldCursor.EndDeferDrawing();
+
+    return hr;
 }
